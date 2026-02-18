@@ -1,81 +1,65 @@
 import { NextResponse } from "next/server";
+import { checkAndBumpUsage } from "@/src/lib/usage";
+import { solveWithGroq } from "@/src/lib/groq";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-export async function POST(req: Request) {
+type HistoryItem = {
+  id: string;
+  ip: string;
+  question: string;
+  answer: string;
+  createdAt: string;
+};
+
+function getIP(request: Request) {
+  const xf = request.headers.get("x-forwarded-for");
+  if (xf) return xf.split(",")[0].trim();
+  return request.headers.get("x-real-ip") || "unknown";
+}
+
+// Global in-memory history (serverless: may reset sometimes)
+const g = globalThis as unknown as { __HISTORY__?: HistoryItem[] };
+if (!g.__HISTORY__) g.__HISTORY__ = [];
+
+export async function POST(request: Request) {
   try {
-    const body = await req.json();
-    const question = body?.question?.toString().trim();
+    const body = await request.json().catch(() => ({}));
+    const question = String(body?.question || "").trim();
 
     if (!question) {
+      return NextResponse.json({ error: "Question required" }, { status: 400 });
+    }
+
+    const ip = getIP(request);
+
+    // rate limit per ip
+    const ok = checkAndBumpUsage(ip);
+    if (!ok) {
       return NextResponse.json(
-        { error: "Question required" },
-        { status: 400 }
+        { error: "Daily limit reached. Try again tomorrow." },
+        { status: 429 }
       );
     }
 
-    const apiKey = process.env.GROQ_API_KEY;
-    if (!apiKey) {
-      return NextResponse.json(
-        { error: "Missing GROQ_API_KEY" },
-        { status: 500 }
-      );
-    }
+    const answer = await solveWithGroq(question);
 
-    // ✅ Groq call
-    const response = await fetch(
-      "https://api.groq.com/openai/v1/chat/completions",
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${apiKey}`,
-        },
-        body: JSON.stringify({
-          model: "llama-3.1-8b-instant",
-          messages: [
-            {
-              role: "system",
-              content:
-                "You are a helpful homework solver. Answer in Hindi and English.",
-            },
-            { role: "user", content: question },
-          ],
-          temperature: 0.3,
-        }),
-      }
-    );
+    const item: HistoryItem = {
+      id: `${Date.now()}_${Math.random().toString(16).slice(2)}`,
+      ip,
+      question,
+      answer,
+      createdAt: new Date().toISOString(),
+    };
 
-    const data = await response.json();
-
-    const answer =
-      data?.choices?.[0]?.message?.content || "No answer generated";
-
-    // ✅ Prisma dynamic import (build crash prevent)
-    try {
-      const { PrismaClient } = await import("@prisma/client");
-      const prisma = new PrismaClient();
-
-      await prisma.submission.create({
-        data: {
-          question,
-          answer,
-          ip: "unknown",
-        },
-      });
-
-      await prisma.$disconnect();
-    } catch (e) {
-      console.log("Prisma skipped in build:", e);
-    }
+    // keep latest 50
+    g.__HISTORY__!.unshift(item);
+    g.__HISTORY__ = g.__HISTORY__!.slice(0, 50);
 
     return NextResponse.json({ answer });
-  } catch (error) {
-    console.error("Solve error:", error);
-    return NextResponse.json(
-      { error: "Internal Server Error" },
-      { status: 500 }
-    );
+  } catch (e: any) {
+    console.error("SOLVE_ERROR", e);
+    return NextResponse.json({ error: "Internal Server Error" }, { status: 500 });
   }
 }
