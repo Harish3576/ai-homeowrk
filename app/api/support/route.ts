@@ -1,37 +1,60 @@
 import { NextResponse } from "next/server";
-import { prisma } from "../../../src/lib/prisma";
 
 export const dynamic = "force-dynamic";
-export const runtime = "nodejs";
 
 export async function POST(req: Request) {
   try {
     const body = await req.json();
-    const message = body?.message;
+    const question = body?.question;
 
-    if (!message) {
+    if (!question) {
       return NextResponse.json(
-        { error: "Message is required" },
+        { error: "Question required" },
         { status: 400 }
       );
     }
 
-    await prisma.submission.create({
-      data: {
-        question: message,
-        answer: "Support Request",
-        ip: "support-user",
+    const GROQ_API_KEY = process.env.GROQ_API_KEY;
+    const GROQ_MODEL = process.env.GROQ_MODEL;
+
+    if (!GROQ_API_KEY || !GROQ_MODEL) {
+      return NextResponse.json(
+        { error: "Groq config missing" },
+        { status: 500 }
+      );
+    }
+
+    const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${GROQ_API_KEY}`,
       },
+      body: JSON.stringify({
+        model: GROQ_MODEL,
+        messages: [
+          {
+            role: "system",
+            content: "You are a helpful homework assistant.",
+          },
+          {
+            role: "user",
+            content: question,
+          },
+        ],
+      }),
     });
 
+    const data = await response.json();
+
     return NextResponse.json({
-      success: true,
-      message: "Support request submitted successfully",
+      answer: data?.choices?.[0]?.message?.content || "No answer",
     });
-  } catch (error) {
-    console.error("Support API Error:", error);
+
+  } catch (err) {
+    console.error(err);
     return NextResponse.json(
-      { error: "Internal Server Error" },
+      { error: "Something went wrong" },
       { status: 500 }
     );
   }
