@@ -1,36 +1,72 @@
 import { NextResponse } from "next/server";
-import { checkAndIncrementUsage } from "@/src/lib/usage";
-import { groqSolve } from "@/src/lib/groq";
-import { prisma } from "@/src/lib/prisma";
+import { prisma } from "../../../src/lib/prisma";
 
-function getIp(req: Request) {
-  const xf = req.headers.get("x-forwarded-for");
-  if (xf) return xf.split(",")[0].trim();
-  return "local";
-}
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
 
 export async function POST(req: Request) {
-  const body = await req.json().catch(() => ({}));
-  const question = String(body.question ?? "").trim();
-  if (!question)
-    return NextResponse.json({ error: "Question is required." }, { status: 400 });
-
-  const ip = getIp(req);
-  const usage = checkAndIncrementUsage(ip);
-  if (!usage.ok) {
-    return NextResponse.json({ error: "LIMIT_REACHED", limit: usage.limit }, { status: 429 });
-  }
-
-  // Wrap the Groq API call and DB write in a try/catch so that any runtime errors are
-  // reported back as JSON. Without this, an unhandled exception would cause the
-  // endpoint to return an HTML error page, which breaks JSON parsing in the client.
   try {
-    const answer = await groqSolve(question);
-    await prisma.submission.create({ data: { ip, question, answer } });
-    return NextResponse.json({ answer, remaining: usage.remaining });
-  } catch (error: any) {
-    console.error(error);
-    const message = typeof error?.message === "string" ? error.message : "Server error";
-    return NextResponse.json({ error: message }, { status: 500 });
+    const body = await req.json().catch(() => ({} as any));
+    const question = (body?.question || "").toString().trim();
+
+    if (!question) {
+      return NextResponse.json({ error: "Question required" }, { status: 400 });
+    }
+
+    // ✅ If GROQ key missing, still return JSON (no crash in build)
+    const apiKey = process.env.GROQ_API_KEY;
+    if (!apiKey) {
+      return NextResponse.json(
+        { error: "GROQ_API_KEY missing in Vercel Environment Variables" },
+        { status: 500 }
+      );
+    }
+
+    // ✅ Call Groq (simple fetch)
+    const groqRes = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({
+        model: "llama-3.1-8b-instant",
+        messages: [
+          { role: "system", content: "You are a helpful homework solver. Answer in Hindi + English." },
+          { role: "user", content: question },
+        ],
+        temperature: 0.2,
+      }),
+    });
+
+    const groqJson = await groqRes.json().catch(() => null);
+
+    if (!groqRes.ok) {
+      return NextResponse.json(
+        { error: "Groq API error", details: groqJson },
+        { status: 500 }
+      );
+    }
+
+    const answer =
+      groqJson?.choices?.[0]?.message?.content?.toString() || "No answer";
+
+    // ✅ Save in DB (never crash build)
+    try {
+      await prisma.submission.create({
+        data: { question, answer, ip: "unknown" },
+      });
+    } catch (e) {
+      // DB fail हो भी जाए तो API फिर भी चलती रहे
+      console.error("DB save failed:", e);
+    }
+
+    return NextResponse.json({ answer });
+  } catch (err) {
+    console.error("Solve API crash:", err);
+    return NextResponse.json(
+      { error: "Internal Server Error" },
+      { status: 500 }
+    );
   }
 }
